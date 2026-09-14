@@ -16,6 +16,9 @@ jobs:
       with:
         node-version: 22.x
 
+    - name: Lint icons
+      run: npm run lint:icons
+
     - name: Install dependencies
       run: cd packages/ia-icons && npm install && npm dedupe
 

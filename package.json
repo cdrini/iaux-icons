@@ -2,6 +2,9 @@
   "name": "@internetarchive/iaux-icons",
   "private": true,
   "license": "AGPL-3.0-only",
+  "scripts": {
+    "lint:icons": "node bin/lint_icons"
+  },
   "devDependencies": {
     "eslint": "^7.4.0",
     "eslint-config-airbnb": "^18.2.0",

@@ -1,0 +1,241 @@
+#!/usr/bin/env node
+// @ts-check
+
+// Verifies that the SVGs in ./icons are resizable and that the packages
+// generated from them by bin/bootstrap_icon are up to date.
+
+const fs = require('fs');
+const path = require('path');
+const indexTemplate = require('../scaffold/index.template');
+const componentTemplate = require('../scaffold/component.template');
+
+/**
+ * One of the checks run below, and the key an exemption is filed under in
+ * {@link ALLOWED_FAILURES}.
+ *
+ * @typedef {'no-size-attributes'
+ *   | 'has-viewbox'
+ *   | 'package-in-sync'
+ *   | 'component-matches-scaffold'} CheckId
+ */
+
+/**
+ * A check that did not pass.
+ *
+ * @typedef {object} Violation
+ * @property {CheckId} id The check that failed.
+ * @property {string} file Repo-relative, forward-slashed path to the offender.
+ * @property {string} message What is wrong, and how to put it right.
+ */
+
+// Newline character based on local OS, matching bin/bootstrap_icon
+const EOL = process.platform === 'win32' ? '\r\n' : '\n';
+
+const ROOT = path.join(__dirname, '..');
+const ICONS_DIR = path.join(ROOT, 'icons');
+const PACKAGES_DIR = path.join(ROOT, 'packages');
+
+/**
+ * Packages that are hand-written rather than produced by bin/bootstrap_icon.
+ * They have no counterpart in ./icons and are exempt from the sync checks.
+ *
+ * @type {string[]}
+ */
+const NON_GENERATED_PACKAGES = ['icon-bookmark'];
+
+/**
+ * Known violations, listing the repo-relative paths tolerated for each check.
+ * Entries are only ever meant to be removed: a path listed here that passes is
+ * itself reported as a failure, so the list cannot silently rot.
+ *
+ * @type {Record<CheckId, string[]>}
+ */
+const ALLOWED_FAILURES = {
+  'no-size-attributes': [
+    // Hand-written multi-state component whose markup is not regenerated.
+    'packages/icon-bookmark/bookmark.svg',
+    // Sized icons predating this check; removing the attributes is a breaking
+    // change, so they are fixed separately rather than here.
+    'icons/close-circle.svg',
+    'icons/edit-pencil.svg',
+    'icons/sort-ascending.svg',
+    'icons/sort-descending.svg',
+  ],
+  'has-viewbox': [],
+  'package-in-sync': [],
+  'component-matches-scaffold': [
+    // Deliberate #999 fallback for --iconFillColor, absent from the scaffold.
+    'packages/icon-close-circle/icon-close-circle.js',
+  ],
+};
+
+/** @type {Violation[]} */
+const failures = [];
+
+/** @type {Violation[]} */
+const allowed = [];
+
+/**
+ * `<check id>:<path>` for every check that passed, used to spot exemptions
+ * that are no longer earning their keep.
+ *
+ * @type {Set<string>}
+ */
+const satisfied = new Set();
+
+/**
+ * Records the outcome of a single check, routing a failure to the allowed pile
+ * when its path is exempt.
+ *
+ * @param {CheckId} id
+ * @param {string} file Absolute path to the file being checked.
+ * @param {boolean} ok
+ * @param {string} message Reported when `ok` is false.
+ * @returns {void}
+ */
+function check(id, file, ok, message) {
+  const relative = path.relative(ROOT, file).split(path.sep).join('/');
+  if (ok) {
+    satisfied.add(`${id}:${relative}`);
+    return;
+  }
+  if (ALLOWED_FAILURES[id].includes(relative)) {
+    allowed.push({ id, file: relative, message });
+  } else {
+    failures.push({ id, file: relative, message });
+  }
+}
+
+/**
+ * @param {string} contents
+ * @returns {string} The opening `<svg>` tag, or '' if there isn't one.
+ */
+function rootSvgTag(contents) {
+  const match = contents.match(/<svg\b[\s\S]*?>/);
+  return match ? match[0] : '';
+}
+
+/**
+ * An icon whose intrinsic size is baked into the markup cannot be scaled by the
+ * --iconWidth/--iconHeight CSS vars the components expose.
+ *
+ * @param {string} svgFile Absolute path to an SVG.
+ * @returns {void}
+ */
+function checkResizable(svgFile) {
+  const tag = rootSvgTag(fs.readFileSync(svgFile, 'utf8'));
+  check('no-size-attributes', svgFile, !/\s(width|height)=/.test(tag),
+    'root <svg> must not set width/height; size it with --iconWidth/--iconHeight instead');
+  check('has-viewbox', svgFile, /\sviewBox=/.test(tag),
+    'root <svg> needs a viewBox, otherwise it cannot scale');
+}
+
+/**
+ * Guards against an icon being edited without bin/bootstrap_icon being re-run,
+ * which leaves consumers importing the previous markup.
+ *
+ * @param {string} iconName Basename of the SVG in ./icons, without extension.
+ * @returns {void}
+ */
+function checkGenerated(iconName) {
+  const packageDir = path.join(PACKAGES_DIR, `icon-${iconName}`);
+  const svg = fs.readFileSync(path.join(ICONS_DIR, `${iconName}.svg`), 'utf8');
+
+  const copiedSvg = path.join(packageDir, `${iconName}.svg`);
+  check('package-in-sync', copiedSvg,
+    fs.existsSync(copiedSvg) && fs.readFileSync(copiedSvg, 'utf8') === svg,
+    `does not match icons/${iconName}.svg; re-run bin/bootstrap_icon ${iconName} -o`);
+
+  const indexFile = path.join(packageDir, 'index.js');
+  const expectedIndex = indexTemplate(svg.replace(new RegExp(`${EOL}$`), ''));
+  check('package-in-sync', indexFile,
+    fs.existsSync(indexFile) && fs.readFileSync(indexFile, 'utf8') === expectedIndex,
+    `embeds stale markup; re-run bin/bootstrap_icon ${iconName} -o`);
+
+  const componentFile = path.join(packageDir, `icon-${iconName}.js`);
+  check('component-matches-scaffold', componentFile,
+    fs.existsSync(componentFile)
+      && fs.readFileSync(componentFile, 'utf8') === componentTemplate(iconName),
+    'diverges from scaffold/component.template.js and would be overwritten by a regen');
+}
+
+/** @type {string[]} */
+const iconNames = fs.readdirSync(ICONS_DIR)
+  .filter((file) => file.endsWith('.svg'))
+  .map((file) => file.replace(/\.svg$/, ''))
+  .sort();
+
+iconNames.forEach((iconName) => {
+  const packageDir = path.join(PACKAGES_DIR, `icon-${iconName}`);
+  checkResizable(path.join(ICONS_DIR, `${iconName}.svg`));
+  if (!fs.existsSync(packageDir)) {
+    check('package-in-sync', packageDir, false,
+      `no package for icons/${iconName}.svg; run bin/bootstrap_icon ${iconName}`);
+    return;
+  }
+  checkGenerated(iconName);
+});
+
+// Hand-written packages still ship SVGs, so hold their markup to the same
+// resizability rules even though nothing regenerates them.
+fs.readdirSync(PACKAGES_DIR)
+  .filter((dir) => dir.startsWith('icon-') && !iconNames.includes(dir.replace(/^icon-/, '')))
+  .sort()
+  .forEach((dir) => {
+    if (!NON_GENERATED_PACKAGES.includes(dir)) {
+      check('package-in-sync', path.join(PACKAGES_DIR, dir), false,
+        'has no icons/*.svg source; add one or list it in NON_GENERATED_PACKAGES');
+      return;
+    }
+    fs.readdirSync(path.join(PACKAGES_DIR, dir))
+      .filter((file) => file.endsWith('.svg'))
+      .forEach((file) => checkResizable(path.join(PACKAGES_DIR, dir, file)));
+  });
+
+// An exemption for something that now passes means the list needs pruning.
+Object.keys(ALLOWED_FAILURES).forEach((key) => {
+  const id = /** @type {CheckId} */ (key);
+  ALLOWED_FAILURES[id].forEach((relative) => {
+    if (satisfied.has(`${id}:${relative}`)) {
+      failures.push({
+        id,
+        file: relative,
+        message: 'passes the check; remove it from ALLOWED_FAILURES in bin/lint_icons',
+      });
+    }
+  });
+});
+
+allowed.forEach(({ id, file, message }) => warningLog(`allowed  ${id}  ${file}: ${message}`));
+failures.forEach(({ id, file, message }) => errorLog(`failed   ${id}  ${file}: ${message}`));
+
+if (failures.length) {
+  errorLog(`${failures.length} problem(s) found across ${iconNames.length} icons.`);
+  process.exit(1);
+}
+
+successLog(`${iconNames.length} icons OK (${allowed.length} allowed failure(s)).`);
+
+/**
+ * @param {string} message
+ * @returns {void}
+ */
+function errorLog(message) {
+  console.log('\x1b[31m%s\x1b[0m', message);
+}
+
+/**
+ * @param {string} message
+ * @returns {void}
+ */
+function successLog(message) {
+  console.log('\x1b[32m%s\x1b[0m', message);
+}
+
+/**
+ * @param {string} message
+ * @returns {void}
+ */
+function warningLog(message) {
+  console.log('\x1b[33m%s\x1b[0m', message);
+}
